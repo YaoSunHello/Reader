@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f2ea">
+    <title>reader</title>
+    <link rel="manifest" href="./manifest.webmanifest">
+    <link rel="icon" href="./icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="library-panel" aria-label="Library">
+        <div class="brand-row">
+          <img src="./icon.svg" alt="" width="32" height="32">
+          <h1>reader</h1>
+        </div>
+
+        <label class="upload-button">
+          <input id="fileInput" type="file" accept=".epub,.pdf,application/epub+zip,application/pdf">
+          <span>Upload EPUB or PDF</span>
+        </label>
+
+        <div class="library-head">
+          <h2>Library</h2>
+          <button id="clearLibraryButton" class="ghost-button" type="button">Clear</button>
+        </div>
+        <div id="libraryList" class="library-list" role="list"></div>
+      </aside>
+
+      <main class="reader-pane">
+        <header class="reader-header">
+          <div class="book-heading">
+            <p id="bookMeta" class="book-meta">No book loaded</p>
+            <h2 id="bookTitle">Upload an EPUB or PDF to begin</h2>
+          </div>
+          <div class="chapter-controls">
+            <button id="previousChapterButton" type="button" title="Previous chapter" aria-label="Previous chapter">Prev</button>
+            <select id="chapterSelect" aria-label="Chapter"></select>
+            <button id="nextChapterButton" type="button" title="Next chapter" aria-label="Next chapter">Next</button>
+          </div>
+        </header>
+
+        <section id="readerSurface" class="reader-surface" aria-live="polite">
+          <div class="empty-state">
+            <p>Upload a book from the left panel. Files stay in this browser.</p>
+          </div>
+        </section>
+
+        <section class="player-bar" aria-label="Playback controls">
+          <div class="transport">
+            <button id="previousSentenceButton" type="button" title="Previous sentence" aria-label="Previous sentence">Back</button>
+            <button id="playButton" class="primary-button" type="button" title="Play" aria-label="Play">Play</button>
+            <button id="pauseButton" type="button" title="Pause" aria-label="Pause">Pause</button>
+            <button id="nextSentenceButton" type="button" title="Next sentence" aria-label="Next sentence">Skip</button>
+          </div>
+
+          <label class="field-control voice-field">
+            <span>Voice</span>
+            <select id="voiceSelect"></select>
+          </label>
+
+          <label class="field-control rate-field">
+            <span>Speed <strong id="rateValue">1.0x</strong></span>
+            <input id="rateSlider" type="range" min="0.6" max="2" step="0.1" value="1">
+          </label>
+
+          <p id="statusLine" class="status-line">Ready</p>
+        </section>
+      </main>
+    </div>
+
+    <div id="busyOverlay" class="busy-overlay" hidden>
+      <div class="busy-box">
+        <div class="spinner" aria-hidden="true"></div>
+        <p id="busyText">Processing book...</p>
+      </div>
+    </div>
+  </body>
+</html>
