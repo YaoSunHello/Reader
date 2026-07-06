@@ -6,17 +6,29 @@ from io import BytesIO
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 
+# Get credentials from environment
+aws_access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+aws_secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+aws_region = os.environ.get('AWS_REGION', 'us-east-1')
+
 # Initialize AWS Polly client
-polly = boto3.client(
-    'polly',
-    region_name=os.environ.get('AWS_REGION', 'us-east-1'),
-    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY')
-)
+if aws_access_key and aws_secret_key:
+    polly = boto3.client(
+        'polly',
+        region_name=aws_region,
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key
+    )
+else:
+    polly = None
+    print(f"WARNING: AWS credentials not found. Expected AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.")
 
 @app.route('/api/speak', methods=['POST'])
 def speak():
     try:
+        if not polly:
+            return {'error': 'AWS credentials not configured'}, 503
+
         data = request.json
         text = data.get('text', '').strip()
 
