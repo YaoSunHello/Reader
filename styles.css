@@ -310,6 +310,10 @@ button:disabled {
   z-index: 10;
 }
 
+.busy-overlay[hidden] {
+  display: none;
+}
+
 .busy-box {
   display: grid;
   gap: 14px;
