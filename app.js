@@ -39,7 +39,7 @@ const elements = {
 };
 
 if (elements.busyOverlay) {
-  elements.busyOverlay.hidden = true;
+  elements.busyOverlay.style.display = 'none';
 }
 
 class LibraryStore {
@@ -744,7 +744,7 @@ function updateControls() {
 
 function setBusy(isBusy, text = "Processing book...") {
   if (!elements.busyOverlay) return;
-  elements.busyOverlay.hidden = !isBusy;
+  elements.busyOverlay.style.display = isBusy ? 'grid' : 'none';
   if (isBusy) {
     elements.busyText.textContent = text;
   }
