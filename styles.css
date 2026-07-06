@@ -258,6 +258,8 @@ button:disabled {
   background: rgb(255 253 248 / 96%);
   box-shadow: var(--shadow);
   padding: 14px 18px;
+  position: relative;
+  z-index: 5;
 }
 
 .transport {
@@ -376,7 +378,7 @@ button:disabled {
   }
 
   .reader-surface {
-    padding: 28px 18px 240px;
+    padding: 28px 18px 300px;
   }
 
   .text-flow {
