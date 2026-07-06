@@ -74,11 +74,14 @@
       </main>
     </div>
 
-    <div id="busyOverlay" class="busy-overlay" hidden>
+    <div id="busyOverlay" class="busy-overlay" style="display: none;">
       <div class="busy-box">
         <div class="spinner" aria-hidden="true"></div>
         <p id="busyText">Processing book...</p>
       </div>
     </div>
+    <script>
+      document.getElementById('busyOverlay').style.display = 'none';
+    </script>
   </body>
 </html>
