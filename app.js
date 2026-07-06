@@ -739,8 +739,11 @@ function updateControls() {
 }
 
 function setBusy(isBusy, text = "Processing book...") {
+  if (!elements.busyOverlay) return;
   elements.busyOverlay.hidden = !isBusy;
-  elements.busyText.textContent = text;
+  if (isBusy) {
+    elements.busyText.textContent = text;
+  }
 }
 
 function setStatus(text) {
