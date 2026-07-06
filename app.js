@@ -148,8 +148,62 @@ class WebSpeechEngine extends SpeechEngine {
   }
 }
 
+class PollyEngine extends SpeechEngine {
+  constructor() {
+    super();
+    this.currentAudio = null;
+    this.isPausedManually = false;
+  }
+
+  async loadVoices() {
+    return [{ name: 'AWS Polly (Joanna)', voiceURI: 'polly-joanna' }];
+  }
+
+  async speakSentence(text, options) {
+    return new Promise((resolve, reject) => {
+      fetch('/api/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      })
+        .then(res => res.blob())
+        .then(blob => {
+          const audio = new Audio(URL.createObjectURL(blob));
+          this.currentAudio = audio;
+          this.isPausedManually = false;
+          audio.onended = () => resolve();
+          audio.onerror = (err) => reject(err);
+          audio.play();
+        })
+        .catch(reject);
+    });
+  }
+
+  pause() {
+    if (this.currentAudio) {
+      this.currentAudio.pause();
+      this.isPausedManually = true;
+    }
+  }
+
+  resume() {
+    if (this.currentAudio && this.isPausedManually) {
+      this.currentAudio.play();
+      this.isPausedManually = false;
+    }
+  }
+
+  cancel() {
+    if (this.currentAudio) {
+      this.currentAudio.pause();
+      this.currentAudio.currentTime = 0;
+      this.isPausedManually = false;
+    }
+  }
+}
+
 const libraryStore = new LibraryStore();
-const speechEngine = new WebSpeechEngine();
+const speechEngine = new PollyEngine();
 
 async function init() {
   if ("serviceWorker" in navigator) {
