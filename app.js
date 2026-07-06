@@ -160,6 +160,7 @@ async function init() {
   window.speechSynthesis?.addEventListener("voiceschanged", loadVoices);
   await refreshLibrary();
   updateControls();
+  setBusy(false);
 }
 
 function bindEvents() {
