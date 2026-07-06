@@ -38,6 +38,10 @@ const elements = {
   busyText: document.querySelector("#busyText")
 };
 
+if (elements.busyOverlay) {
+  elements.busyOverlay.hidden = true;
+}
+
 class LibraryStore {
   constructor() {
     this.dbPromise = this.open();
