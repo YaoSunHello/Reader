@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#f5f2ea">
-    <title>reader</title>
+    <meta name="theme-color" content="#080706">
+    <title>Aurum Reader</title>
     <link rel="manifest" href="./manifest.webmanifest">
     <link rel="icon" href="./icon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="./styles.css">
@@ -18,12 +18,12 @@
       <aside class="library-panel" aria-label="Library">
         <div class="brand-row">
           <img src="./icon.svg" alt="" width="32" height="32">
-          <h1>reader</h1>
+          <h1>Aurum Reader</h1>
         </div>
 
         <label class="upload-button">
           <input id="fileInput" type="file" accept=".epub,.pdf,application/epub+zip,application/pdf">
-          <span>Upload EPUB or PDF</span>
+          <span>Choose your book</span>
         </label>
 
         <div class="library-head">
@@ -40,9 +40,9 @@
             <h2 id="bookTitle">Upload an EPUB or PDF to begin</h2>
           </div>
           <div class="chapter-controls">
-            <button id="previousChapterButton" type="button" title="Previous chapter" aria-label="Previous chapter">Prev</button>
+            <button id="previousChapterButton" type="button" title="Previous chapter" aria-label="Previous chapter">Earlier</button>
             <select id="chapterSelect" aria-label="Chapter"></select>
-            <button id="nextChapterButton" type="button" title="Next chapter" aria-label="Next chapter">Next</button>
+            <button id="nextChapterButton" type="button" title="Next chapter" aria-label="Next chapter">Later</button>
           </div>
         </header>
 
@@ -54,10 +54,10 @@
 
         <section class="player-bar" aria-label="Playback controls">
           <div class="transport">
-            <button id="previousSentenceButton" type="button" title="Previous sentence" aria-label="Previous sentence">Back</button>
-            <button id="playButton" class="primary-button" type="button" title="Play" aria-label="Play">Play</button>
-            <button id="pauseButton" type="button" title="Pause" aria-label="Pause">Pause</button>
-            <button id="nextSentenceButton" type="button" title="Next sentence" aria-label="Next sentence">Skip</button>
+            <button id="previousSentenceButton" type="button" title="Previous sentence" aria-label="Previous sentence">Rewind</button>
+            <button id="playButton" class="primary-button" type="button" title="Read aloud" aria-label="Read aloud">Read aloud</button>
+            <button id="pauseButton" type="button" title="Hold narration" aria-label="Hold narration">Hold</button>
+            <button id="nextSentenceButton" type="button" title="Next sentence" aria-label="Next sentence">Onward</button>
           </div>
 
           <label class="field-control voice-field">

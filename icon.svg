@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="reader icon">
-  <rect width="128" height="128" rx="26" fill="#1f6f5b"/>
-  <path d="M30 30h36c12 0 22 10 22 22v46H52c-12 0-22-10-22-22V30z" fill="#fffdf8"/>
-  <path d="M42 48h32M42 62h30M42 76h22" stroke="#1f6f5b" stroke-width="7" stroke-linecap="round"/>
-  <path d="M88 38v60" stroke="#ffe08a" stroke-width="8" stroke-linecap="round"/>
+  <rect width="128" height="128" rx="26" fill="#080706"/>
+  <path d="M30 30h36c12 0 22 10 22 22v46H52c-12 0-22-10-22-22V30z" fill="#f6e7bc"/>
+  <path d="M42 48h32M42 62h30M42 76h22" stroke="#080706" stroke-width="7" stroke-linecap="round"/>
+  <path d="M88 38v60" stroke="#c99b3f" stroke-width="8" stroke-linecap="round"/>
 </svg>

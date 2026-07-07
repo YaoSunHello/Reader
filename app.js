@@ -910,8 +910,8 @@ function updateControls() {
   elements.nextSentenceButton.disabled = !hasBook;
   elements.playButton.disabled = !hasBook;
   elements.pauseButton.disabled = !hasBook || !state.isPlaying;
-  elements.playButton.textContent = state.isPaused ? "Resume" : "Play";
-  elements.pauseButton.textContent = state.isPaused ? "Resume" : "Pause";
+  elements.playButton.textContent = state.isPaused ? "Resume reading" : "Read aloud";
+  elements.pauseButton.textContent = state.isPaused ? "Continue" : "Hold";
 }
 
 function setBusy(isBusy, text = "Processing book...") {
