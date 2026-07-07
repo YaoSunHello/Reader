@@ -270,11 +270,18 @@ class WebSpeechEngine extends SpeechEngine {
 }
 
 class PollyEngine extends SpeechEngine {
-  constructor(audioCache) {
+  constructor(audioCache, fallbackEngine) {
     super();
     this.audioCache = audioCache;
-    this.currentAudio = null;
+    this.fallbackEngine = fallbackEngine;
+    this.currentAudio = document.createElement("audio");
+    this.currentAudio.preload = "auto";
+    this.currentAudio.style.display = "none";
+    this.currentObjectUrl = "";
+    this.currentReject = null;
     this.isPausedManually = false;
+    this.useFallbackOnly = false;
+    document.body.append(this.currentAudio);
   }
 
   async loadVoices() {
@@ -282,59 +289,120 @@ class PollyEngine extends SpeechEngine {
   }
 
   async speakSentence(text, options) {
+    if (this.useFallbackOnly && this.fallbackEngine) {
+      await this.fallbackEngine.speakSentence(text, { ...options, voice: null });
+      return;
+    }
+
     const cacheKey = await this.cacheKey(text, options);
-    let blob = null;
-    let fromCache = false;
     try {
-      blob = await this.audioCache.getCachedAudio(cacheKey);
-      fromCache = Boolean(blob);
+      const blob = await this.getAudioBlob(text, cacheKey, false);
+      await this.playBlob(blob, options);
+      return;
+    } catch (error) {
+      console.warn("Polly playback failed.", error);
+      await this.audioCache.deleteCachedAudio(cacheKey).catch(() => {});
+      try {
+        const blob = await this.getAudioBlob(text, cacheKey, true);
+        await this.playBlob(blob, options);
+        return;
+      } catch (retryError) {
+        console.warn("Fresh Polly playback failed.", retryError);
+        if (this.fallbackEngine) {
+          this.useFallbackOnly = true;
+          setStatus("Using system voice for this sentence.");
+          await this.fallbackEngine.speakSentence(text, { ...options, voice: null });
+          return;
+        }
+        throw this.audioError(retryError);
+      }
+    }
+  }
+
+  async getAudioBlob(text, cacheKey, refreshAudio) {
+    let blob = null;
+    try {
+      if (!refreshAudio) blob = await this.audioCache.getCachedAudio(cacheKey);
     } catch (error) {
       console.warn("Polly audio cache read failed.", error);
     }
-    if (!blob) {
-      const response = await fetch("/api/speak", {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text })
-      });
-      if (!response.ok) {
-        const error = await response.json().catch(() => ({}));
-        throw new Error(error.error || "Polly speech request failed.");
-      }
-      const contentType = response.headers.get("content-type") || "";
-      if (!contentType.includes("audio/")) {
-        throw new Error("Polly returned an unsupported audio response.");
-      }
-      blob = await response.blob();
-      if (!this.isPlayableAudioBlob(blob)) {
-        throw new Error("Polly returned unsupported audio.");
-      }
-      try {
-        await this.audioCache.putCachedAudio(cacheKey, blob);
-      } catch (error) {
-        console.warn("Polly audio cache write failed.", error);
-      }
-    }
+    if (blob) return blob;
 
+    const response = await fetch("/api/speak", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(refreshAudio ? { "X-Reader-Refresh-Audio": "1" } : {})
+      },
+      body: JSON.stringify({ text })
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || "Polly speech request failed.");
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.includes("audio/")) {
+      throw new Error("Polly returned an unsupported audio response.");
+    }
+    blob = await response.blob();
+    if (!this.isPlayableAudioBlob(blob)) {
+      throw new Error("Polly returned unsupported audio.");
+    }
+    try {
+      await this.audioCache.putCachedAudio(cacheKey, blob);
+    } catch (error) {
+      console.warn("Polly audio cache write failed.", error);
+    }
+    return blob;
+  }
+
+  playBlob(blob, options) {
     return new Promise((resolve, reject) => {
-      const audio = new Audio(URL.createObjectURL(blob));
-      audio.playbackRate = this.normalizeRate(options.rate);
-      this.currentAudio = audio;
-      this.isPausedManually = false;
-      audio.onended = () => {
-        URL.revokeObjectURL(audio.src);
+      const audio = this.currentAudio;
+      let started = false;
+      let settled = false;
+
+      const cleanup = () => {
+        audio.removeEventListener("canplay", start);
+        audio.removeEventListener("loadedmetadata", start);
+        audio.removeEventListener("ended", finish);
+        audio.removeEventListener("error", failFromMediaElement);
+        window.clearTimeout(startTimer);
+        if (this.currentReject === fail) this.currentReject = null;
+      };
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this.releaseAudioSource();
         resolve();
       };
-      audio.onerror = (err) => {
-        URL.revokeObjectURL(audio.src);
-        if (fromCache) this.audioCache.deleteCachedAudio(cacheKey).catch(() => {});
-        reject(this.audioError(err));
-      };
-      audio.play().catch((error) => {
-        URL.revokeObjectURL(audio.src);
-        if (fromCache) this.audioCache.deleteCachedAudio(cacheKey).catch(() => {});
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this.releaseAudioSource();
         reject(this.audioError(error));
-      });
+      };
+      const failFromMediaElement = () => fail(audio.error || new Error("Audio playback failed."));
+      const start = () => {
+        if (started || settled) return;
+        started = true;
+        audio.play().catch(fail);
+      };
+
+      this.currentReject = fail;
+      this.releaseAudioSource();
+      this.currentObjectUrl = URL.createObjectURL(blob);
+      audio.src = this.currentObjectUrl;
+      audio.playbackRate = this.normalizeRate(options.rate);
+      this.isPausedManually = false;
+      audio.addEventListener("canplay", start);
+      audio.addEventListener("loadedmetadata", start);
+      audio.addEventListener("ended", finish);
+      audio.addEventListener("error", failFromMediaElement);
+      const startTimer = window.setTimeout(start, 1200);
+      audio.load();
     });
   }
 
@@ -372,9 +440,22 @@ class PollyEngine extends SpeechEngine {
 
   audioError(error) {
     if (error?.name === "NotSupportedError") {
-      return new Error("This audio could not be played. Try again; cached bad audio was cleared.");
+      return new Error("This audio could not be played. The app retried Polly and fell back to the system voice.");
+    }
+    if (error?.name === "NotAllowedError") {
+      return new Error("Browser audio playback was blocked. Press Read aloud again.");
     }
     return error instanceof Error ? error : new Error("Audio playback failed.");
+  }
+
+  releaseAudioSource() {
+    this.currentAudio.pause();
+    this.currentAudio.removeAttribute("src");
+    this.currentAudio.load();
+    if (this.currentObjectUrl) {
+      URL.revokeObjectURL(this.currentObjectUrl);
+      this.currentObjectUrl = "";
+    }
   }
 
   pause() {
@@ -396,15 +477,15 @@ class PollyEngine extends SpeechEngine {
 
   cancel() {
     if (this.currentAudio) {
-      this.currentAudio.pause();
-      this.currentAudio.currentTime = 0;
+      if (this.currentReject) this.currentReject(new Error("Playback cancelled."));
+      this.releaseAudioSource();
       this.isPausedManually = false;
     }
   }
 }
 
 const libraryStore = new LibraryStore();
-const speechEngine = new PollyEngine(libraryStore);
+const speechEngine = new PollyEngine(libraryStore, new WebSpeechEngine());
 
 async function init() {
   if ("serviceWorker" in navigator) {

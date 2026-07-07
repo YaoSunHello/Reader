@@ -52,13 +52,23 @@ def speak():
             return {'error': 'No text provided'}, 400
 
         cache_path = polly_cache_path(text)
+        refresh_audio = request.headers.get('X-Reader-Refresh-Audio') == '1'
+        if refresh_audio and cache_path.exists():
+            cache_path.unlink()
+
         if cache_path.exists():
-            return send_file(
-                cache_path,
-                mimetype='audio/mpeg',
-                as_attachment=False,
-                max_age=31536000
-            )
+            if cache_path.stat().st_size == 0:
+                cache_path.unlink()
+            else:
+                return send_file(
+                    cache_path,
+                    mimetype='audio/mpeg',
+                    as_attachment=False,
+                    max_age=31536000
+                )
+
+        if not polly:
+            return {'error': 'AWS credentials not configured'}, 503
 
         # Call AWS Polly
         response = polly.synthesize_speech(
@@ -70,6 +80,9 @@ def speak():
 
         # Get the audio stream
         audio = response['AudioStream'].read()
+        if not audio:
+            return {'error': 'Polly returned empty audio'}, 502
+
         with NamedTemporaryFile(dir=polly_cache_dir, delete=False) as temp_file:
             temp_file.write(audio)
             temp_path = Path(temp_file.name)
