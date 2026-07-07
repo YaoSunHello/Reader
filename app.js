@@ -143,6 +143,10 @@ class LibraryStore {
     this.trimAudioCache().catch(() => {});
   }
 
+  async deleteCachedAudio(id) {
+    return this.withNamedStore(AUDIO_STORE, "readwrite", (store) => store.delete(id));
+  }
+
   async markSentenceRead(bookId, chapterIndex, sentenceIndex, text, audioCacheKey) {
     if (!bookId || !text) return;
     return this.withNamedStore(READ_HISTORY_STORE, "readwrite", (store) => store.put({
@@ -280,8 +284,10 @@ class PollyEngine extends SpeechEngine {
   async speakSentence(text, options) {
     const cacheKey = await this.cacheKey(text, options);
     let blob = null;
+    let fromCache = false;
     try {
       blob = await this.audioCache.getCachedAudio(cacheKey);
+      fromCache = Boolean(blob);
     } catch (error) {
       console.warn("Polly audio cache read failed.", error);
     }
@@ -295,7 +301,14 @@ class PollyEngine extends SpeechEngine {
         const error = await response.json().catch(() => ({}));
         throw new Error(error.error || "Polly speech request failed.");
       }
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("audio/")) {
+        throw new Error("Polly returned an unsupported audio response.");
+      }
       blob = await response.blob();
+      if (!this.isPlayableAudioBlob(blob)) {
+        throw new Error("Polly returned unsupported audio.");
+      }
       try {
         await this.audioCache.putCachedAudio(cacheKey, blob);
       } catch (error) {
@@ -314,11 +327,13 @@ class PollyEngine extends SpeechEngine {
       };
       audio.onerror = (err) => {
         URL.revokeObjectURL(audio.src);
-        reject(err);
+        if (fromCache) this.audioCache.deleteCachedAudio(cacheKey).catch(() => {});
+        reject(this.audioError(err));
       };
       audio.play().catch((error) => {
         URL.revokeObjectURL(audio.src);
-        reject(error);
+        if (fromCache) this.audioCache.deleteCachedAudio(cacheKey).catch(() => {});
+        reject(this.audioError(error));
       });
     });
   }
@@ -351,6 +366,17 @@ class PollyEngine extends SpeechEngine {
     return clamp(Number(rate) || 1, 0.6, 2);
   }
 
+  isPlayableAudioBlob(blob) {
+    return blob?.size > 0 && (!blob.type || blob.type.includes("audio/") || blob.type === "application/octet-stream");
+  }
+
+  audioError(error) {
+    if (error?.name === "NotSupportedError") {
+      return new Error("This audio could not be played. Try again; cached bad audio was cleared.");
+    }
+    return error instanceof Error ? error : new Error("Audio playback failed.");
+  }
+
   pause() {
     if (this.currentAudio) {
       this.currentAudio.pause();
@@ -360,8 +386,11 @@ class PollyEngine extends SpeechEngine {
 
   resume() {
     if (this.currentAudio && this.isPausedManually) {
-      this.currentAudio.play();
-      this.isPausedManually = false;
+      this.currentAudio.play()
+        .then(() => {
+          this.isPausedManually = false;
+        })
+        .catch((error) => setStatus(this.audioError(error).message));
     }
   }
 
