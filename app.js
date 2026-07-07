@@ -1,10 +1,13 @@
 const CDN_PDF_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
 const DB_NAME = "reader-library";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const BOOK_STORE = "books";
 const AUDIO_STORE = "pollyAudio";
-const AUDIO_CACHE_MAX_BYTES = 150 * 1024 * 1024;
+const APP_STATE_STORE = "appState";
+const READ_HISTORY_STORE = "readHistory";
+const AUDIO_CACHE_MAX_BYTES = 200 * 1024 * 1024;
 const AUDIO_CACHE_MAX_ITEMS = 2000;
+const LAST_ACTIVE_BOOK_KEY = "lastActiveBookId";
 
 const state = {
   books: [],
@@ -62,6 +65,14 @@ class LibraryStore {
           const audioStore = db.createObjectStore(AUDIO_STORE, { keyPath: "id" });
           audioStore.createIndex("lastUsedAt", "lastUsedAt");
         }
+        if (!db.objectStoreNames.contains(APP_STATE_STORE)) {
+          db.createObjectStore(APP_STATE_STORE, { keyPath: "key" });
+        }
+        if (!db.objectStoreNames.contains(READ_HISTORY_STORE)) {
+          const readHistoryStore = db.createObjectStore(READ_HISTORY_STORE, { keyPath: "id" });
+          readHistoryStore.createIndex("bookId", "bookId");
+          readHistoryStore.createIndex("readAt", "readAt");
+        }
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
@@ -78,6 +89,19 @@ class LibraryStore {
 
   async clearBooks() {
     return this.withStore("readwrite", (store) => store.clear());
+  }
+
+  async getAppState(key) {
+    const entry = await this.withNamedStore(APP_STATE_STORE, "readonly", (store) => store.get(key));
+    return entry?.value;
+  }
+
+  async setAppState(key, value) {
+    return this.withNamedStore(APP_STATE_STORE, "readwrite", (store) => store.put({ key, value }));
+  }
+
+  async clearAppState() {
+    return this.withNamedStore(APP_STATE_STORE, "readwrite", (store) => store.clear());
   }
 
   async getCachedAudio(id) {
@@ -119,6 +143,19 @@ class LibraryStore {
     this.trimAudioCache().catch(() => {});
   }
 
+  async markSentenceRead(bookId, chapterIndex, sentenceIndex, text, audioCacheKey) {
+    if (!bookId || !text) return;
+    return this.withNamedStore(READ_HISTORY_STORE, "readwrite", (store) => store.put({
+      id: `${bookId}:${chapterIndex}:${sentenceIndex}`,
+      bookId,
+      chapterIndex,
+      sentenceIndex,
+      text,
+      audioCacheKey,
+      readAt: Date.now()
+    }));
+  }
+
   async trimAudioCache() {
     const db = await this.dbPromise;
     const entries = await new Promise((resolve, reject) => {
@@ -148,10 +185,14 @@ class LibraryStore {
   }
 
   async withStore(mode, action) {
+    return this.withNamedStore(BOOK_STORE, mode, action);
+  }
+
+  async withNamedStore(storeName, mode, action) {
     const db = await this.dbPromise;
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction(BOOK_STORE, mode);
-      const store = transaction.objectStore(BOOK_STORE);
+      const transaction = db.transaction(storeName, mode);
+      const store = transaction.objectStore(storeName);
       const request = action(store);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
@@ -172,6 +213,8 @@ class SpeechEngine {
   pause() {}
 
   resume() {}
+
+  setRate() {}
 
   cancel() {}
 }
@@ -262,6 +305,7 @@ class PollyEngine extends SpeechEngine {
 
     return new Promise((resolve, reject) => {
       const audio = new Audio(URL.createObjectURL(blob));
+      audio.playbackRate = this.normalizeRate(options.rate);
       this.currentAudio = audio;
       this.isPausedManually = false;
       audio.onended = () => {
@@ -295,6 +339,16 @@ class PollyEngine extends SpeechEngine {
       hash = Math.imul(hash, 16777619);
     }
     return (hash >>> 0).toString(16);
+  }
+
+  setRate(rate) {
+    if (this.currentAudio) {
+      this.currentAudio.playbackRate = this.normalizeRate(rate);
+    }
+  }
+
+  normalizeRate(rate) {
+    return clamp(Number(rate) || 1, 0.6, 2);
   }
 
   pause() {
@@ -335,6 +389,7 @@ async function init() {
   await loadVoices();
   window.speechSynthesis?.addEventListener("voiceschanged", loadVoices);
   await refreshLibrary();
+  await restoreLastActiveBook();
   updateControls();
   setBusy(false);
 }
@@ -350,7 +405,9 @@ function bindEvents() {
   elements.previousSentenceButton.addEventListener("click", () => moveSentence(-1, true));
   elements.nextSentenceButton.addEventListener("click", () => moveSentence(1, true));
   elements.rateSlider.addEventListener("input", () => {
-    elements.rateValue.textContent = `${Number(elements.rateSlider.value).toFixed(1)}x`;
+    const rate = Number(elements.rateSlider.value);
+    elements.rateValue.textContent = `${rate.toFixed(1)}x`;
+    speechEngine.setRate(rate);
   });
   elements.readerSurface.addEventListener("click", (event) => {
     const sentence = event.target.closest(".sentence");
@@ -385,6 +442,13 @@ function renderVoiceOptions(selectedVoiceURI) {
 async function refreshLibrary() {
   state.books = (await libraryStore.getAllBooks()).sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
   renderLibrary();
+}
+
+async function restoreLastActiveBook() {
+  if (!state.books.length) return;
+  const savedBookId = await libraryStore.getAppState(LAST_ACTIVE_BOOK_KEY);
+  const book = state.books.find((item) => item.id === savedBookId) || state.books[0];
+  if (book) await openBook(book.id);
 }
 
 function renderLibrary() {
@@ -461,6 +525,7 @@ async function openBook(id) {
     state.activeBook.lastOpenedAt = Date.now();
     state.chapterIndex = clamp(book.position?.chapterIndex || 0, 0, Math.max(0, state.chapters.length - 1));
     state.sentenceIndex = clamp(book.position?.sentenceIndex || 0, 0, Math.max(0, getCurrentSentences().length - 1));
+    await libraryStore.setAppState(LAST_ACTIVE_BOOK_KEY, id);
     await saveActiveBook();
     renderLibrary();
     renderBook();
@@ -773,11 +838,14 @@ async function playFromCurrent() {
 
     highlightCurrentSentence(true);
     await saveActiveBook();
+    const speechOptions = {
+      voice: state.voices[Number(elements.voiceSelect.value)] || null,
+      rate: Number(elements.rateSlider.value)
+    };
+    const audioCacheKey = await getSpeechCacheKey(sentence, speechOptions);
     try {
-      await speechEngine.speakSentence(sentence, {
-        voice: state.voices[Number(elements.voiceSelect.value)] || null,
-        rate: Number(elements.rateSlider.value)
-      });
+      await speechEngine.speakSentence(sentence, speechOptions);
+      await libraryStore.markSentenceRead(state.activeBookId, state.chapterIndex, state.sentenceIndex, sentence, audioCacheKey);
     } catch (error) {
       if (state.playbackToken === token) setStatus(String(error));
       break;
@@ -785,6 +853,7 @@ async function playFromCurrent() {
 
     if (state.playbackToken !== token) break;
     if (!advancePosition()) break;
+    await saveActiveBook();
   }
 
   if (state.playbackToken === token) {
@@ -875,6 +944,11 @@ function getCurrentSentences() {
   return state.chapters[state.chapterIndex]?.sentences || [];
 }
 
+async function getSpeechCacheKey(sentence, options) {
+  if (typeof speechEngine.cacheKey !== "function") return "";
+  return speechEngine.cacheKey(sentence, options).catch(() => "");
+}
+
 async function saveActiveBook() {
   if (!state.activeBook) return;
   state.activeBook.position = {
@@ -882,6 +956,7 @@ async function saveActiveBook() {
     sentenceIndex: state.sentenceIndex
   };
   state.activeBook.lastOpenedAt = Date.now();
+  await libraryStore.setAppState(LAST_ACTIVE_BOOK_KEY, state.activeBook.id);
   await libraryStore.putBook(state.activeBook);
   state.books = state.books.map((book) => (book.id === state.activeBook.id ? state.activeBook : book));
 }
@@ -889,6 +964,7 @@ async function saveActiveBook() {
 async function clearLibrary() {
   stopPlayback();
   await libraryStore.clearBooks();
+  await libraryStore.clearAppState();
   state.books = [];
   state.activeBook = null;
   state.activeBookId = null;

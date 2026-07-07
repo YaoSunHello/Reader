@@ -27,6 +27,8 @@ Reader uses AWS Polly only when it needs to synthesize new audio. The app now ch
 
 - Repeated playback is cheap because cached MP3 audio is reused.
 - A new charge happens when the app sees new text, a changed voice, a changed engine, or cleared/missing caches.
-- The browser cache is capped at `150 MB` or `2000` audio items.
+- The browser audio cache is capped at `200 MB` or `2000` audio items.
+- The app also records a local read-history ledger with the sentence text, book location, and audio cache key for each completed sentence.
+- The read-history ledger helps restore and audit reading progress; the actual billing reduction comes from reusing cached MP3 audio.
 - The server cache defaults to `/tmp/reader-polly-cache`; some hosts wipe `/tmp` during restart or redeploy.
 - For the best long-term savings, configure `POLLY_CACHE_DIR` to persistent storage if the hosting platform supports it.
