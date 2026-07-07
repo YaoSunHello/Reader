@@ -1,7 +1,10 @@
 const CDN_PDF_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
 const DB_NAME = "reader-library";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const BOOK_STORE = "books";
+const AUDIO_STORE = "pollyAudio";
+const AUDIO_CACHE_MAX_BYTES = 150 * 1024 * 1024;
+const AUDIO_CACHE_MAX_ITEMS = 2000;
 
 const state = {
   books: [],
@@ -55,6 +58,10 @@ class LibraryStore {
         if (!db.objectStoreNames.contains(BOOK_STORE)) {
           db.createObjectStore(BOOK_STORE, { keyPath: "id" });
         }
+        if (!db.objectStoreNames.contains(AUDIO_STORE)) {
+          const audioStore = db.createObjectStore(AUDIO_STORE, { keyPath: "id" });
+          audioStore.createIndex("lastUsedAt", "lastUsedAt");
+        }
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
@@ -71,6 +78,73 @@ class LibraryStore {
 
   async clearBooks() {
     return this.withStore("readwrite", (store) => store.clear());
+  }
+
+  async getCachedAudio(id) {
+    const db = await this.dbPromise;
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(AUDIO_STORE, "readwrite");
+      const store = transaction.objectStore(AUDIO_STORE);
+      const request = store.get(id);
+      request.onsuccess = () => {
+        const entry = request.result;
+        if (!entry) {
+          resolve(null);
+          return;
+        }
+        entry.lastUsedAt = Date.now();
+        store.put(entry);
+        resolve(entry.blob);
+      };
+      request.onerror = () => reject(request.error);
+      transaction.onerror = () => reject(transaction.error);
+    });
+  }
+
+  async putCachedAudio(id, blob) {
+    const db = await this.dbPromise;
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(AUDIO_STORE, "readwrite");
+      const store = transaction.objectStore(AUDIO_STORE);
+      store.put({
+        id,
+        blob,
+        size: blob.size,
+        createdAt: Date.now(),
+        lastUsedAt: Date.now()
+      });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    this.trimAudioCache().catch(() => {});
+  }
+
+  async trimAudioCache() {
+    const db = await this.dbPromise;
+    const entries = await new Promise((resolve, reject) => {
+      const transaction = db.transaction(AUDIO_STORE, "readonly");
+      const request = transaction.objectStore(AUDIO_STORE).getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+
+    let totalBytes = entries.reduce((sum, entry) => sum + (entry.size || 0), 0);
+    const oldestFirst = entries.sort((a, b) => a.lastUsedAt - b.lastUsedAt);
+    const idsToDelete = [];
+    while ((totalBytes > AUDIO_CACHE_MAX_BYTES || oldestFirst.length - idsToDelete.length > AUDIO_CACHE_MAX_ITEMS) && oldestFirst.length) {
+      const entry = oldestFirst.shift();
+      idsToDelete.push(entry.id);
+      totalBytes -= entry.size || 0;
+    }
+    if (!idsToDelete.length) return;
+
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(AUDIO_STORE, "readwrite");
+      const store = transaction.objectStore(AUDIO_STORE);
+      idsToDelete.forEach((id) => store.delete(id));
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
   }
 
   async withStore(mode, action) {
@@ -149,34 +223,78 @@ class WebSpeechEngine extends SpeechEngine {
 }
 
 class PollyEngine extends SpeechEngine {
-  constructor() {
+  constructor(audioCache) {
     super();
+    this.audioCache = audioCache;
     this.currentAudio = null;
     this.isPausedManually = false;
   }
 
   async loadVoices() {
-    return [{ name: 'AWS Polly (Joanna)', voiceURI: 'polly-joanna' }];
+    return [{ name: "AWS Polly (Joanna)", voiceURI: "polly-joanna", lang: "en-US" }];
   }
 
   async speakSentence(text, options) {
-    return new Promise((resolve, reject) => {
-      fetch('/api/speak', {
+    const cacheKey = await this.cacheKey(text, options);
+    let blob = null;
+    try {
+      blob = await this.audioCache.getCachedAudio(cacheKey);
+    } catch (error) {
+      console.warn("Polly audio cache read failed.", error);
+    }
+    if (!blob) {
+      const response = await fetch("/api/speak", {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text })
-      })
-        .then(res => res.blob())
-        .then(blob => {
-          const audio = new Audio(URL.createObjectURL(blob));
-          this.currentAudio = audio;
-          this.isPausedManually = false;
-          audio.onended = () => resolve();
-          audio.onerror = (err) => reject(err);
-          audio.play();
-        })
-        .catch(reject);
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || "Polly speech request failed.");
+      }
+      blob = await response.blob();
+      try {
+        await this.audioCache.putCachedAudio(cacheKey, blob);
+      } catch (error) {
+        console.warn("Polly audio cache write failed.", error);
+      }
+    }
+
+    return new Promise((resolve, reject) => {
+      const audio = new Audio(URL.createObjectURL(blob));
+      this.currentAudio = audio;
+      this.isPausedManually = false;
+      audio.onended = () => {
+        URL.revokeObjectURL(audio.src);
+        resolve();
+      };
+      audio.onerror = (err) => {
+        URL.revokeObjectURL(audio.src);
+        reject(err);
+      };
+      audio.play().catch((error) => {
+        URL.revokeObjectURL(audio.src);
+        reject(error);
+      });
     });
+  }
+
+  async cacheKey(text, options) {
+    const voice = options.voice?.voiceURI || "polly-joanna";
+    const payload = `polly:v1:${voice}:standard:mp3:${text}`;
+    if (!globalThis.crypto?.subtle) return `fallback-${this.hashString(payload)}`;
+    const data = new TextEncoder().encode(payload);
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  hashString(value) {
+    let hash = 2166136261;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
   }
 
   pause() {
@@ -203,7 +321,7 @@ class PollyEngine extends SpeechEngine {
 }
 
 const libraryStore = new LibraryStore();
-const speechEngine = new PollyEngine();
+const speechEngine = new PollyEngine(libraryStore);
 
 async function init() {
   if ("serviceWorker" in navigator) {
