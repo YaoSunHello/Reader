@@ -8,6 +8,17 @@ const READ_HISTORY_STORE = "readHistory";
 const AUDIO_CACHE_MAX_BYTES = 200 * 1024 * 1024;
 const AUDIO_CACHE_MAX_ITEMS = 2000;
 const LAST_ACTIVE_BOOK_KEY = "lastActiveBookId";
+const POLLY_SEGMENT_MAX_CHARS = 2800;
+const POLLY_SEGMENT_MAX_SENTENCES = 12;
+const DEBUG_TTS = isDebugTtsEnabled();
+
+function isDebugTtsEnabled() {
+  try {
+    return localStorage.getItem("DEBUG_TTS") === "1" || globalThis.DEBUG_TTS === true;
+  } catch {
+    return globalThis.DEBUG_TTS === true;
+  }
+}
 
 const state = {
   books: [],
@@ -20,6 +31,14 @@ const state = {
   isPlaying: false,
   isPaused: false,
   voices: []
+};
+
+const ttsControl = {
+  pending: false,
+  pendingTimer: 0,
+  lastButtonPressAt: 0,
+  intent: "idle",
+  watchdogId: 0
 };
 
 const elements = {
@@ -246,12 +265,30 @@ class WebSpeechEngine extends SpeechEngine {
     if (!this.synthesis) {
       return Promise.reject(new Error("Web Speech API is not available in this browser."));
     }
+    if (typeof options.shouldContinue === "function" && !options.shouldContinue()) {
+      return Promise.reject(new Error("Playback cancelled."));
+    }
     return new Promise((resolve, reject) => {
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = options.rate;
       utterance.voice = options.voice || null;
-      utterance.onend = () => resolve();
-      utterance.onerror = (event) => reject(event.error || new Error("Speech synthesis failed."));
+      utterance.onstart = () => {
+        clearTtsPending("onstart");
+        if (options.onStart) {
+          options.onStart();
+        } else {
+          logTtsState("onstart");
+        }
+      };
+      utterance.onend = () => {
+        logTtsState("onend");
+        resolve();
+      };
+      utterance.onerror = (event) => {
+        logTtsState("onerror", { error: event.error || "Speech synthesis failed." });
+        clearTtsPending("onerror");
+        reject(event.error || new Error("Speech synthesis failed."));
+      };
       this.synthesis.speak(utterance);
     });
   }
@@ -264,8 +301,8 @@ class WebSpeechEngine extends SpeechEngine {
     this.synthesis?.resume();
   }
 
-  cancel() {
-    this.synthesis?.cancel();
+  async cancel() {
+    await resetSpeech("web speech cancel");
   }
 }
 
@@ -276,6 +313,7 @@ class PollyEngine extends SpeechEngine {
     this.fallbackEngine = fallbackEngine;
     this.currentAudio = document.createElement("audio");
     this.currentAudio.preload = "auto";
+    this.currentAudio.setAttribute("playsinline", "");
     this.currentAudio.style.display = "none";
     this.currentObjectUrl = "";
     this.currentReject = null;
@@ -297,16 +335,24 @@ class PollyEngine extends SpeechEngine {
     const cacheKey = await this.cacheKey(text, options);
     try {
       const blob = await this.getAudioBlob(text, cacheKey, false);
+      if (typeof options.shouldContinue === "function" && !options.shouldContinue()) {
+        throw new Error("Playback cancelled.");
+      }
       await this.playBlob(blob, options);
       return;
     } catch (error) {
+      if (error?.message === "Playback cancelled.") throw error;
       console.warn("Polly playback failed.", error);
       await this.audioCache.deleteCachedAudio(cacheKey).catch(() => {});
       try {
         const blob = await this.getAudioBlob(text, cacheKey, true);
+        if (typeof options.shouldContinue === "function" && !options.shouldContinue()) {
+          throw new Error("Playback cancelled.");
+        }
         await this.playBlob(blob, options);
         return;
       } catch (retryError) {
+        if (retryError?.message === "Playback cancelled.") throw retryError;
         console.warn("Fresh Polly playback failed.", retryError);
         if (this.fallbackEngine) {
           this.useFallbackOnly = true;
@@ -388,7 +434,12 @@ class PollyEngine extends SpeechEngine {
       const start = () => {
         if (started || settled) return;
         started = true;
-        audio.play().catch(fail);
+        audio.play()
+          .then(() => {
+            clearTtsPending("audio start");
+            options.onStart?.();
+          })
+          .catch(fail);
       };
 
       this.currentReject = fail;
@@ -459,6 +510,10 @@ class PollyEngine extends SpeechEngine {
   }
 
   pause() {
+    if (this.useFallbackOnly && this.fallbackEngine) {
+      this.fallbackEngine.pause();
+      return;
+    }
     if (this.currentAudio) {
       this.currentAudio.pause();
       this.isPausedManually = true;
@@ -466,6 +521,10 @@ class PollyEngine extends SpeechEngine {
   }
 
   resume() {
+    if (this.useFallbackOnly && this.fallbackEngine) {
+      this.fallbackEngine.resume();
+      return;
+    }
     if (this.currentAudio && this.isPausedManually) {
       this.currentAudio.play()
         .then(() => {
@@ -475,12 +534,13 @@ class PollyEngine extends SpeechEngine {
     }
   }
 
-  cancel() {
+  async cancel() {
     if (this.currentAudio) {
       if (this.currentReject) this.currentReject(new Error("Playback cancelled."));
       this.releaseAudioSource();
       this.isPausedManually = false;
     }
+    if (this.fallbackEngine) await this.fallbackEngine.cancel();
   }
 }
 
@@ -488,6 +548,7 @@ const libraryStore = new LibraryStore();
 const speechEngine = new PollyEngine(libraryStore, new WebSpeechEngine());
 
 async function init() {
+  await cancelQueuedSpeechOnInit();
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch(() => {});
   }
@@ -496,6 +557,7 @@ async function init() {
   }
 
   bindEvents();
+  configureMediaSession();
   await loadVoices();
   window.speechSynthesis?.addEventListener("voiceschanged", loadVoices);
   await refreshLibrary();
@@ -504,14 +566,115 @@ async function init() {
   setBusy(false);
 }
 
+function ttsDebug(...args) {
+  if (DEBUG_TTS) console.log("[tts]", ...args);
+}
+
+function getSpeechSynthesisState() {
+  const synthesis = window.speechSynthesis;
+  return {
+    speaking: Boolean(synthesis?.speaking),
+    paused: Boolean(synthesis?.paused),
+    queuePending: Boolean(synthesis?.pending)
+  };
+}
+
+function getSpeechSynthesisMode() {
+  const status = getSpeechSynthesisState();
+  if (status.paused) return "paused";
+  if (status.speaking || status.queuePending) return "speaking";
+  return "idle";
+}
+
+function logTtsState(event, extra = {}) {
+  const status = getSpeechSynthesisState();
+  ttsDebug(event, {
+    speaking: status.speaking,
+    paused: status.paused,
+    pending: ttsControl.pending,
+    queuePending: status.queuePending,
+    intent: ttsControl.intent,
+    ...extra
+  });
+}
+
+function waitForNextTick() {
+  return new Promise((resolve) => window.setTimeout(resolve, 0));
+}
+
+async function resetSpeech(reason = "reset") {
+  const synthesis = window.speechSynthesis;
+  if (!synthesis) return;
+
+  synthesis.cancel();
+  logTtsState("resetSpeech cancel", { reason });
+  await waitForNextTick();
+
+  const deadline = performance.now() + 250;
+  while ((synthesis.speaking || synthesis.paused) && performance.now() < deadline) {
+    if (synthesis.paused) synthesis.resume();
+    synthesis.cancel();
+    await waitForNextTick();
+  }
+
+  logTtsState("resetSpeech done", { reason });
+  if (synthesis.speaking || synthesis.paused) {
+    throw new Error("Speech synthesis queue did not reset.");
+  }
+}
+
+function beginTtsTransition() {
+  ttsControl.pending = true;
+  window.clearTimeout(ttsControl.pendingTimer);
+  ttsControl.pendingTimer = window.setTimeout(() => clearTtsPending("timeout"), 250);
+  updateControls();
+}
+
+function clearTtsPending(reason) {
+  if (!ttsControl.pending) return;
+  ttsControl.pending = false;
+  window.clearTimeout(ttsControl.pendingTimer);
+  ttsControl.pendingTimer = 0;
+  logTtsState("pending cleared", { reason });
+  updateControls();
+}
+
+function startTtsWatchdog() {
+  if (ttsControl.watchdogId) return;
+  ttsControl.watchdogId = window.setInterval(() => {
+    const synthesis = window.speechSynthesis;
+    if (ttsControl.intent !== "playing") {
+      stopTtsWatchdog();
+      return;
+    }
+    if (synthesis?.paused) {
+      logTtsState("watchdog resume");
+      synthesis.resume();
+    }
+  }, 1000);
+}
+
+function stopTtsWatchdog() {
+  if (!ttsControl.watchdogId) return;
+  window.clearInterval(ttsControl.watchdogId);
+  ttsControl.watchdogId = 0;
+}
+
+async function cancelQueuedSpeechOnInit() {
+  await resetSpeech("init").catch((error) => {
+    console.warn(error);
+  });
+  ttsDebug("speechSynthesis.cancel() called on init", Boolean(window.speechSynthesis));
+}
+
 function bindEvents() {
   elements.fileInput.addEventListener("change", handleUpload);
   elements.clearLibraryButton.addEventListener("click", clearLibrary);
   elements.chapterSelect.addEventListener("change", () => openChapter(Number(elements.chapterSelect.value), 0));
   elements.previousChapterButton.addEventListener("click", () => openChapter(state.chapterIndex - 1, 0));
   elements.nextChapterButton.addEventListener("click", () => openChapter(state.chapterIndex + 1, 0));
-  elements.playButton.addEventListener("click", togglePlay);
-  elements.pauseButton.addEventListener("click", togglePause);
+  elements.playButton.addEventListener("click", () => handleTtsButtonPress("play"));
+  elements.pauseButton.addEventListener("click", () => handleTtsButtonPress("pause"));
   elements.previousSentenceButton.addEventListener("click", () => moveSentence(-1, true));
   elements.nextSentenceButton.addEventListener("click", () => moveSentence(1, true));
   elements.rateSlider.addEventListener("input", () => {
@@ -524,6 +687,28 @@ function bindEvents() {
     if (!sentence) return;
     setPosition(Number(sentence.dataset.chapterIndex), Number(sentence.dataset.sentenceIndex), true);
   });
+}
+
+function configureMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  navigator.mediaSession.setActionHandler("play", () => handleTtsButtonPress("play"));
+  navigator.mediaSession.setActionHandler("pause", () => handleTtsButtonPress("pause"));
+  navigator.mediaSession.setActionHandler("stop", () => stopPlayback());
+  navigator.mediaSession.setActionHandler("previoustrack", () => moveSentence(-1, true));
+  navigator.mediaSession.setActionHandler("nexttrack", () => moveSentence(1, true));
+}
+
+function updateMediaSession() {
+  if (!("mediaSession" in navigator) || !state.activeBook) return;
+  if ("MediaMetadata" in window) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: state.activeBook.title || state.activeBook.name || "Aurum Reader",
+      artist: state.activeBook.author || "Aurum Reader",
+      album: state.chapters[state.chapterIndex]?.title || "",
+      artwork: [{ src: "./icon.svg", sizes: "128x128", type: "image/svg+xml" }]
+    });
+  }
+  navigator.mediaSession.playbackState = state.isPlaying && !state.isPaused ? "playing" : state.isPaused ? "paused" : "none";
 }
 
 async function loadVoices() {
@@ -622,7 +807,7 @@ async function openBook(id) {
   const book = state.books.find((item) => item.id === id) || (await libraryStore.getAllBooks()).find((item) => item.id === id);
   if (!book) return;
 
-  stopPlayback();
+  await stopPlayback();
   state.activeBookId = id;
   state.activeBook = book;
   setBusy(true, `Extracting ${book.kind.toUpperCase()} text...`);
@@ -635,6 +820,7 @@ async function openBook(id) {
     state.activeBook.lastOpenedAt = Date.now();
     state.chapterIndex = clamp(book.position?.chapterIndex || 0, 0, Math.max(0, state.chapters.length - 1));
     state.sentenceIndex = clamp(book.position?.sentenceIndex || 0, 0, Math.max(0, getCurrentSentences().length - 1));
+    logSavedPosition("book load");
     await libraryStore.setAppState(LAST_ACTIVE_BOOK_KEY, id);
     await saveActiveBook();
     renderLibrary();
@@ -868,6 +1054,7 @@ function renderBook() {
   );
   renderChapter();
   updateControls();
+  updateMediaSession();
 }
 
 function renderChapter() {
@@ -907,28 +1094,110 @@ function highlightCurrentSentence(scroll = true) {
   }
 }
 
-async function togglePlay() {
-  if (state.isPaused) {
-    speechEngine.resume();
+async function handleTtsButtonPress(source) {
+  const now = performance.now();
+  logTtsState("button press", { source });
+  if (ttsControl.pending) {
+    logTtsState("button press ignored while pending", { source });
+    return;
+  }
+  if (now - ttsControl.lastButtonPressAt < 150) {
+    logTtsState("button press debounced", { source });
+    return;
+  }
+  ttsControl.lastButtonPressAt = now;
+
+  beginTtsTransition();
+  const mode = getSpeechSynthesisMode();
+  try {
+    if (mode === "paused") {
+      resumePlayback();
+      return;
+    }
+    if (mode === "speaking") {
+      pausePlayback();
+      return;
+    }
+    await handleIdleTtsPress(source);
+  } catch (error) {
+    ttsControl.intent = "idle";
+    state.isPlaying = false;
     state.isPaused = false;
-    state.isPlaying = true;
+    stopTtsWatchdog();
+    clearTtsPending("error");
     updateControls();
+    setStatus(error.message || "Speech playback failed.");
+  }
+}
+
+async function handleIdleTtsPress(source) {
+  if (source === "pause" && !state.isPlaying) {
+    clearTtsPending("idle pause");
+    return;
+  }
+  if (source === "pause" && state.isPlaying && !state.isPaused) {
+    pausePlayback();
+    return;
+  }
+  if (state.isPaused) {
+    resumePlayback();
     return;
   }
   if (state.isPlaying) return;
+
+  await resetSpeech("start playback");
+  ttsControl.intent = "playing";
+  startTtsWatchdog();
+  await resumeFromSavedPosition();
+}
+
+function pausePlayback() {
+  if (!state.isPlaying && getSpeechSynthesisMode() !== "speaking") {
+    clearTtsPending("idle pause");
+    return;
+  }
+  ttsControl.intent = "paused";
+  stopTtsWatchdog();
+  if (getSpeechSynthesisMode() === "speaking") window.speechSynthesis?.pause();
+  speechEngine.pause();
+  state.isPaused = true;
+  state.isPlaying = true;
+  updateControls();
+}
+
+function resumePlayback() {
+  ttsControl.intent = "playing";
+  startTtsWatchdog();
+  if (getSpeechSynthesisMode() === "paused") window.speechSynthesis?.resume();
+  speechEngine.resume();
+  state.isPaused = false;
+  state.isPlaying = true;
+  updateControls();
+}
+
+async function resumeFromSavedPosition() {
+  if (!state.chapters.length || !state.activeBook) return;
+  restoreSavedPosition();
+  renderChapterIfNeeded();
+  highlightCurrentSentence(true);
+  updateControls();
+  logSavedPosition("resume");
   await playFromCurrent();
 }
 
-function togglePause() {
-  if (!state.isPlaying) return;
-  if (state.isPaused) {
-    speechEngine.resume();
-    state.isPaused = false;
-  } else {
-    speechEngine.pause();
-    state.isPaused = true;
-  }
-  updateControls();
+function restoreSavedPosition() {
+  const position = state.activeBook?.position || {};
+  state.chapterIndex = clamp(position.chapterIndex || 0, 0, Math.max(0, state.chapters.length - 1));
+  state.sentenceIndex = clamp(position.sentenceIndex || 0, 0, Math.max(0, getCurrentSentences().length - 1));
+}
+
+function logSavedPosition(context) {
+  const segment = getCurrentSpeechSegment();
+  ttsDebug(`${context}: saved chunk index on load`, {
+    chapterIndex: state.chapterIndex,
+    chunkIndex: state.sentenceIndex,
+    chunkLength: segment.text.length
+  });
 }
 
 async function playFromCurrent() {
@@ -937,55 +1206,101 @@ async function playFromCurrent() {
   const token = ++state.playbackToken;
   state.isPlaying = true;
   state.isPaused = false;
+  ttsControl.intent = "playing";
+  startTtsWatchdog();
   updateControls();
 
-  while (state.playbackToken === token && state.chapterIndex < state.chapters.length) {
-    const sentence = getCurrentSentences()[state.sentenceIndex];
-    if (!sentence) {
-      if (!advancePosition()) break;
-      continue;
+  const finishPlayback = async () => {
+    if (state.playbackToken !== token) return;
+    state.isPlaying = false;
+    state.isPaused = false;
+    ttsControl.intent = "idle";
+    stopTtsWatchdog();
+    updateControls();
+    await saveActiveBook();
+  };
+
+  const speakNext = async () => {
+    if (state.playbackToken !== token || state.chapterIndex >= state.chapters.length) {
+      await finishPlayback();
+      return;
+    }
+
+    const segment = getCurrentSpeechSegment();
+    if (!segment.sentences.length) {
+      if (!advancePosition()) {
+        await finishPlayback();
+        return;
+      }
+      await saveActiveBook();
+      await speakNext();
+      return;
     }
 
     highlightCurrentSentence(true);
-    await saveActiveBook();
+    ttsDebug("speak chunk", {
+      chapterIndex: state.chapterIndex,
+      chunkIndex: state.sentenceIndex,
+      chunkLength: segment.text.length
+    });
     const speechOptions = {
       voice: state.voices[Number(elements.voiceSelect.value)] || null,
-      rate: Number(elements.rateSlider.value)
+      rate: Number(elements.rateSlider.value),
+      shouldContinue: () => state.playbackToken === token,
+      onStart: () => logTtsState("onstart", {
+        chapterIndex: segment.sentences[0].chapterIndex,
+        chunkIndex: segment.sentences[0].sentenceIndex,
+        chunkLength: segment.text.length
+      })
     };
-    const audioCacheKey = await getSpeechCacheKey(sentence, speechOptions);
+    const audioCacheKey = await getSpeechCacheKey(segment.text, speechOptions);
+    if (state.playbackToken !== token) return;
     try {
-      await speechEngine.speakSentence(sentence, speechOptions);
-      await libraryStore.markSentenceRead(state.activeBookId, state.chapterIndex, state.sentenceIndex, sentence, audioCacheKey);
+      await speechEngine.speakSentence(segment.text, speechOptions);
+      logTtsState("onend", {
+        chapterIndex: segment.sentences[0].chapterIndex,
+        chunkIndex: segment.sentences[0].sentenceIndex,
+        chunkLength: segment.text.length
+      });
+      await markSegmentRead(segment, audioCacheKey);
     } catch (error) {
+      logTtsState("onerror", { error: error?.message || String(error) });
       if (state.playbackToken === token) setStatus(String(error));
-      break;
+      await finishPlayback();
+      return;
     }
 
-    if (state.playbackToken !== token) break;
-    if (!advancePosition()) break;
+    if (state.playbackToken !== token) return;
+    const hasMore = advancePositionBy(segment.sentences.length);
     await saveActiveBook();
-  }
+    if (!hasMore) {
+      await finishPlayback();
+      return;
+    }
 
-  if (state.playbackToken === token) {
-    state.isPlaying = false;
-    state.isPaused = false;
-    updateControls();
-    await saveActiveBook();
-  }
+    await speakNext();
+  };
+
+  await speakNext();
 }
 
-function stopPlayback() {
+async function stopPlayback() {
   state.playbackToken += 1;
   state.isPlaying = false;
   state.isPaused = false;
-  speechEngine.cancel();
+  ttsControl.intent = "idle";
+  stopTtsWatchdog();
+  clearTtsPending("stop");
+  await Promise.resolve(speechEngine.cancel()).catch((error) => {
+    console.warn(error);
+  });
   updateControls();
 }
 
 async function moveSentence(delta, restartPlayback) {
   if (!state.chapters.length) return;
   const wasPlaying = state.isPlaying && !state.isPaused;
-  stopPlayback();
+  await stopPlayback();
 
   if (delta > 0) {
     advancePosition();
@@ -996,7 +1311,11 @@ async function moveSentence(delta, restartPlayback) {
   renderChapterIfNeeded();
   highlightCurrentSentence(true);
   await saveActiveBook();
-  if (restartPlayback && wasPlaying) playFromCurrent();
+  if (restartPlayback && wasPlaying) {
+    ttsControl.intent = "playing";
+    startTtsWatchdog();
+    await playFromCurrent();
+  }
 }
 
 function advancePosition() {
@@ -1032,26 +1351,63 @@ function renderChapterIfNeeded() {
   if (elements.chapterSelect.value !== String(state.chapterIndex)) renderChapter();
 }
 
-function openChapter(chapterIndex, sentenceIndex = 0) {
+async function openChapter(chapterIndex, sentenceIndex = 0) {
   if (!state.chapters.length) return;
-  stopPlayback();
+  await stopPlayback();
   state.chapterIndex = clamp(chapterIndex, 0, state.chapters.length - 1);
   state.sentenceIndex = clamp(sentenceIndex, 0, Math.max(0, getCurrentSentences().length - 1));
   renderChapter();
-  saveActiveBook();
+  await saveActiveBook();
   updateControls();
 }
 
-function setPosition(chapterIndex, sentenceIndex, save) {
-  stopPlayback();
+async function setPosition(chapterIndex, sentenceIndex, save) {
+  await stopPlayback();
   state.chapterIndex = chapterIndex;
   state.sentenceIndex = sentenceIndex;
   highlightCurrentSentence(true);
-  if (save) saveActiveBook();
+  if (save) await saveActiveBook();
 }
 
 function getCurrentSentences() {
   return state.chapters[state.chapterIndex]?.sentences || [];
+}
+
+function getCurrentSpeechSegment() {
+  const sentences = getCurrentSentences();
+  const selected = [];
+  let text = "";
+  for (let index = state.sentenceIndex; index < sentences.length && selected.length < POLLY_SEGMENT_MAX_SENTENCES; index += 1) {
+    const sentence = sentences[index];
+    const nextText = text ? `${text} ${sentence}` : sentence;
+    if (selected.length && nextText.length > POLLY_SEGMENT_MAX_CHARS) break;
+    selected.push({
+      chapterIndex: state.chapterIndex,
+      sentenceIndex: index,
+      text: sentence
+    });
+    text = nextText;
+  }
+  return { text, sentences: selected };
+}
+
+async function markSegmentRead(segment, audioCacheKey) {
+  for (const sentence of segment.sentences) {
+    await libraryStore.markSentenceRead(
+      state.activeBookId,
+      sentence.chapterIndex,
+      sentence.sentenceIndex,
+      sentence.text,
+      audioCacheKey
+    );
+  }
+}
+
+function advancePositionBy(count) {
+  for (let index = 0; index < count; index += 1) {
+    if (!advancePosition()) return false;
+  }
+  return true;
 }
 
 async function getSpeechCacheKey(sentence, options) {
@@ -1072,7 +1428,7 @@ async function saveActiveBook() {
 }
 
 async function clearLibrary() {
-  stopPlayback();
+  await stopPlayback();
   await libraryStore.clearBooks();
   await libraryStore.clearAppState();
   state.books = [];
@@ -1094,10 +1450,11 @@ function updateControls() {
   elements.chapterSelect.disabled = !hasBook;
   elements.previousSentenceButton.disabled = !hasBook;
   elements.nextSentenceButton.disabled = !hasBook;
-  elements.playButton.disabled = !hasBook;
-  elements.pauseButton.disabled = !hasBook || !state.isPlaying;
+  elements.playButton.disabled = !hasBook || ttsControl.pending;
+  elements.pauseButton.disabled = !hasBook || !state.isPlaying || ttsControl.pending;
   elements.playButton.textContent = state.isPaused ? "Resume reading" : "Read aloud";
   elements.pauseButton.textContent = state.isPaused ? "Continue" : "Hold";
+  updateMediaSession();
 }
 
 function setBusy(isBusy, text = "Processing book...") {
