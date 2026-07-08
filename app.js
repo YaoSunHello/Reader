@@ -1399,7 +1399,7 @@ async function startPlayback(fromChunkIndex = 0, source = "play") {
         sentenceIndex: chunk.sentenceIndex,
         chunkLength: chunk.text.length
       }),
-      onEnd: async () => {
+      onEnd: () => {
         const completedIndex = currentIndex;
         const nextIndex = clampChunkIndex(completedIndex + 1, { allowEnd: true });
         const chunksLength = state.speechQueue.length;
@@ -1411,7 +1411,16 @@ async function startPlayback(fromChunkIndex = 0, source = "play") {
         let persistedIndex = state.currentChunkIndex;
         if (shouldPersist) {
           state.currentChunkIndex = nextIndex;
-          persistedIndex = await persistCompletedChunkIndex(completedIndex, nextIndex);
+          persistedIndex = nextIndex;
+          persistCompletedChunkIndex(completedIndex, nextIndex).catch((error) => {
+            console.warn("Saved position update failed.", error);
+            ttsDebug("onend persist failed", {
+              completedIndex,
+              nextIndex,
+              persistedIndex,
+              error
+            });
+          });
         }
         ttsDebug("onend", {
           completedIndex,
